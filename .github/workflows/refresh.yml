@@ -1,33 +1,18 @@
-name: Refresh vote data
 
-on:
-  schedule:
-    - cron: '17 9 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  refresh:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build data file
-        env:
-          CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
-        run: python build_data.py
-      - name: Commit if changed
-        run: |
-          git config user.name "data-refresh-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add data.json
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "Refresh vote data"
-            git push
-          fi
+1s
+Run git config user.name "data-refresh-bot"
+[main f47fee9] Refresh vote data
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+To https://github.com/PancakeStackers/app-data
+ ! [rejected]        main -> main (fetch first)
+error: failed to push some refs to 'https://github.com/PancakeStackers/app-data'
+hint: Updates were rejected because the remote contains work that you do not
+hint: have locally. This is usually caused by another repository pushing to
+hint: the same ref. If you want to integrate the remote changes, use
+hint: 'git pull' before pushing again.
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.
+Error: Process completed with exit code 1.
+0s
+0s
+Post job cleanup.
+/usr/bin/git version
