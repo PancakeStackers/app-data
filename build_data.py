@@ -1,3 +1,4 @@
+import datetime
 import html
 import json
 import os
@@ -13,14 +14,12 @@ if not api_key:
     api_key = input("Paste your Congress.gov API key and press Enter: ").strip()
 api_key = api_key.strip('"').strip("'")
 
-CONGRESS = 119
-SESSION = 2
-HOUSE_WANTED = 12     # how many recent House passage votes to collect
-SENATE_WANTED = 12    # how many recent Senate passage votes to collect
+SESSIONS_TO_COVER = 3      # the current session plus the two before it
+HOUSE_PER_SESSION = 15     # passage votes to keep from each session
+SENATE_PER_SESSION = 15
+HOUSE_SCAN_LIMIT = 200     # how many recent roll calls to look through per session
 
 OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
-MENU_URL = ("https://www.senate.gov/legislative/LIS/roll_call_lists/"
-            "vote_menu_" + str(CONGRESS) + "_" + str(SESSION) + ".xml")
 
 JSON_HEADERS = {"User-Agent": "Mozilla/5.0 (voting-app-prototype)",
                 "Accept": "application/json"}
@@ -30,6 +29,29 @@ SENATE_PASSAGE = ("on passage", "on the joint resolution",
                   "on the concurrent resolution", "on the resolution")
 CODES = {"Yea": "Y", "Aye": "Y", "Nay": "N", "No": "N",
          "Present": "P", "Not Voting": "NV"}
+
+
+def current_congress_session(now=None):
+    """A new Congress starts on January 3 of every odd-numbered year."""
+    now = now or datetime.datetime.utcnow()
+    y = now.year
+    if y % 2 == 1:
+        if (now.month, now.day) >= (1, 3):
+            return (y - 1789) // 2 + 1, 1
+        return (y - 1 - 1790) // 2 + 1, 2
+    return (y - 1790) // 2 + 1, 2
+
+
+def sessions_list():
+    c, s = current_congress_session()
+    out = []
+    for _ in range(SESSIONS_TO_COVER):
+        out.append((c, s))
+        if s == 2:
+            s = 1
+        else:
+            c, s = c - 1, 2
+    return out
 
 
 def fetch(url, headers, tries=3):
@@ -86,10 +108,10 @@ def clean(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def bill_details(doc_type, doc_number):
+def bill_details(congress, doc_type, doc_number):
     """Returns title, summary, summary_status, text_url."""
     kind = re.sub(r"[^a-z]", "", doc_type.lower())
-    path = "bill/%d/%s/%s" % (CONGRESS, kind, doc_number)
+    path = "bill/%d/%s/%s" % (congress, kind, doc_number)
     title, summary, status, text_url = None, None, "none", None
 
     bill = call(path)
@@ -115,10 +137,94 @@ def bill_details(doc_type, doc_number):
     return title, summary, status, text_url
 
 
-votes = []
+def collect_house(congress, session):
+    out = []
+    data = call("house-vote/%d/%d" % (congress, session), {"limit": 1})
+    total = int(((data or {}).get("pagination") or {}).get("count") or 0)
+    print("  House %d-%d: %d roll calls so far" % (congress, session, total))
+    for n in range(total, 0, -1):
+        if len(out) >= HOUSE_PER_SESSION or total - n >= HOUSE_SCAN_LIMIT:
+            break
+        vote = call("house-vote/%d/%d/%d/members" % (congress, session, n))
+        time.sleep(0.2)
+        if not vote:
+            continue
+        info = vote.get("houseRollCallVoteMemberVotes", {})
+        question = info.get("voteQuestion") or ""
+        members = info.get("results")
+        if "pass" not in question.lower() or not isinstance(members, list):
+            continue
+        doc_type = info.get("legislationType") or ""
+        doc_number = str(info.get("legislationNumber") or "")
+        if not doc_type or not doc_number:
+            continue
+        title, summary, status, text_url = bill_details(congress, doc_type, doc_number)
+        cast = {}
+        for m in members:
+            cast[m.get("bioguideID")] = CODES.get(m.get("voteCast"), "NV")
+        out.append({
+            "id": "%d-%d-h%d" % (congress, session, n), "chamber": "House",
+            "date": (info.get("startDate") or "")[:10],
+            "bill": doc_type + " " + doc_number,
+            "title": title, "question": question,
+            "result": info.get("result"),
+            "summary": summary, "summary_status": status,
+            "text_url": text_url, "house_votes": cast,
+        })
+        print("    House vote", n, doc_type, doc_number, "| summary:", status)
+    return out
 
-# ---------- House members (to map state + district to a person) ----------
-print("Collecting House members...")
+
+def collect_senate(congress, session):
+    out = []
+    menu_url = ("https://www.senate.gov/legislative/LIS/roll_call_lists/"
+                "vote_menu_%d_%d.xml" % (congress, session))
+    menu = senate_xml(menu_url)
+    if menu is None:
+        print("  Senate %d-%d: no vote list yet" % (congress, session))
+        return out
+    rows = [v for v in menu.findall(".//vote")
+            if child(v, "question").lower().startswith(SENATE_PASSAGE)]
+    rows.sort(key=lambda v: int(child(v, "vote_number") or 0), reverse=True)
+    print("  Senate %d-%d: %d passage votes found" % (congress, session, len(rows)))
+    for v in rows[:SENATE_PER_SESSION]:
+        number = int(child(v, "vote_number"))
+        url = ("https://www.senate.gov/legislative/LIS/roll_call_votes/vote%d%d/"
+               "vote_%d_%d_%s.xml" % (congress, session, congress, session,
+                                      str(number).zfill(5)))
+        root = senate_xml(url)
+        time.sleep(0.2)
+        if root is None:
+            continue
+        doc_type = child(root, "document/document_type")
+        doc_number = child(root, "document/document_number")
+        if not doc_type or not doc_number:
+            continue
+        title, summary, status, text_url = bill_details(congress, doc_type, doc_number)
+        cast = []
+        for m in root.findall(".//members/member"):
+            cast.append({
+                "state": child(m, "state"),
+                "name": child(m, "last_name"),
+                "party": child(m, "party"),
+                "cast": CODES.get(child(m, "vote_cast"), "NV"),
+            })
+        out.append({
+            "id": "%d-%d-s%d" % (congress, session, number), "chamber": "Senate",
+            "date": child(root, "vote_date"),
+            "bill": doc_type + " " + doc_number,
+            "title": title,
+            "question": child(root, "vote_question_text"),
+            "result": child(root, "vote_result"),
+            "summary": summary, "summary_status": status,
+            "text_url": text_url, "senate_votes": cast,
+        })
+        print("    Senate vote", number, doc_type, doc_number, "| summary:", status)
+    return out
+
+
+# ---------- House members (current) ----------
+print("Collecting current House members...")
 house_members = []
 offset = 0
 while True:
@@ -140,93 +246,23 @@ while True:
     offset += 250
 print("  House members found:", len(house_members))
 
-# ---------- House votes ----------
-print("Collecting House passage votes (this takes a few minutes)...")
-data = call("house-vote/%d/%d" % (CONGRESS, SESSION), {"limit": 1})
-total = int(((data or {}).get("pagination") or {}).get("count") or 0)
-found = 0
-for n in range(total, 0, -1):
-    if found >= HOUSE_WANTED or total - n > 150:
-        break
-    vote = call("house-vote/%d/%d/%d/members" % (CONGRESS, SESSION, n))
-    time.sleep(0.2)
-    if not vote:
-        continue
-    info = vote.get("houseRollCallVoteMemberVotes", {})
-    question = info.get("voteQuestion") or ""
-    members = info.get("results")
-    if "pass" not in question.lower() or not isinstance(members, list):
-        continue
-    doc_type = info.get("legislationType") or ""
-    doc_number = str(info.get("legislationNumber") or "")
-    if not doc_type or not doc_number:
-        continue
-    title, summary, status, text_url = bill_details(doc_type, doc_number)
-    cast = {}
-    for m in members:
-        cast[m.get("bioguideID")] = CODES.get(m.get("voteCast"), "NV")
-    votes.append({
-        "id": "h" + str(n), "chamber": "House",
-        "date": (info.get("startDate") or "")[:10],
-        "bill": doc_type + " " + doc_number,
-        "title": title, "question": question,
-        "result": info.get("result"),
-        "summary": summary, "summary_status": status,
-        "text_url": text_url, "house_votes": cast,
-    })
-    found += 1
-    print("  House vote", n, doc_type, doc_number, "| summary:", status)
+# ---------- votes, newest session first ----------
+sessions = sessions_list()
+print("Sessions covered:", sessions)
+votes = []
+for congress, session in sessions:
+    print("Session", congress, session)
+    votes.extend(collect_house(congress, session))
+    votes.extend(collect_senate(congress, session))
 
-# ---------- Senate votes ----------
-print("Collecting Senate passage votes...")
-menu = senate_xml(MENU_URL)
-rows = []
-if menu is not None:
-    rows = [v for v in menu.findall(".//vote")
-            if child(v, "question").lower().startswith(SENATE_PASSAGE)]
-    rows.sort(key=lambda v: int(child(v, "vote_number") or 0), reverse=True)
-for v in rows[:SENATE_WANTED]:
-    number = int(child(v, "vote_number"))
-    url = ("https://www.senate.gov/legislative/LIS/roll_call_votes/vote"
-           + str(CONGRESS) + str(SESSION) + "/vote_" + str(CONGRESS) + "_"
-           + str(SESSION) + "_" + str(number).zfill(5) + ".xml")
-    root = senate_xml(url)
-    time.sleep(0.2)
-    if root is None:
-        continue
-    doc_type = child(root, "document/document_type")
-    doc_number = child(root, "document/document_number")
-    if not doc_type or not doc_number:
-        continue
-    title, summary, status, text_url = bill_details(doc_type, doc_number)
-    cast = []
-    for m in root.findall(".//members/member"):
-        cast.append({
-            "state": child(m, "state"),
-            "name": child(m, "last_name"),
-            "party": child(m, "party"),
-            "cast": CODES.get(child(m, "vote_cast"), "NV"),
-        })
-    votes.append({
-        "id": "s" + str(number), "chamber": "Senate",
-        "date": child(root, "vote_date"),
-        "bill": doc_type + " " + doc_number,
-        "title": title,
-        "question": child(root, "vote_question_text"),
-        "result": child(root, "vote_result"),
-        "summary": summary, "summary_status": status,
-        "text_url": text_url, "senate_votes": cast,
-    })
-    print("  Senate vote", number, doc_type, doc_number, "| summary:", status)
-
+# ---------- safety check and save ----------
 if len(house_members) < 400 or len(votes) < 10:
     print("Something looks wrong (too little data). Keeping the old data.json.")
     raise SystemExit(1)
-# ---------- save ----------
+
 output = {
     "generated": time.strftime("%Y-%m-%d %H:%M", time.gmtime()),
-    "congress": CONGRESS,
-    "session": SESSION,
+    "sessions": sessions,
     "house_members": house_members,
     "votes": votes,
 }
@@ -242,4 +278,3 @@ print("Done.")
 print("House members:", len(house_members))
 print("Votes saved:", len(votes), "| summary status:", counts)
 print("File size:", size_kb, "KB")
-print("Saved to:", OUT_FILE)
