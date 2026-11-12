@@ -1,0 +1,43 @@
+name: Refresh challenger data
+
+on:
+  schedule:
+    - cron: '47 11 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build challenger files
+        env:
+          FEC_API_KEY: ${{ secrets.FEC_API_KEY }}
+        run: python -u build_challengers.py
+      - name: Save the new files
+        run: |
+          git config user.name "data-refresh-bot"
+          git config user.email "actions@users.noreply.github.com"
+          rm -rf "$RUNNER_TEMP/challengers"
+          cp -r challengers "$RUNNER_TEMP/challengers"
+          git fetch origin main
+          git reset --hard origin/main
+          rm -rf challengers
+          cp -r "$RUNNER_TEMP/challengers" challengers
+          git add challengers
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Refresh challenger data"
+            git push origin HEAD:main
+          fi
