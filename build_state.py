@@ -19,6 +19,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (voting-app-prototype)",
 STATES = {"PA": "Pennsylvania"}
 DAYS_BACK = 270          # how far back to look for bills with recent activity
 MAX_BILL_PAGES = 80      # 20 bills per page
+KEEP_BILLS = 100         # newest bills with floor votes that go into the file
+STOP_AT = 160            # stop paging once this many are found (a buffer before trimming)
 PAUSE = 7                # seconds between requests (free tier allows about 10 a minute)
 
 OPTION_CODES = {"yes": "Y", "no": "N"}
@@ -122,6 +124,16 @@ def is_bill(b):
     return bool(re.match(r"^(HB|SB)\b", (b.get("identifier") or "").upper()))
 
 
+def latest_vote_date(bill):
+    return max([v.get("date") or "" for v in bill["votes"].values()] or [""])
+
+
+def trim(bills):
+    """Keep only the newest bills, judged by their latest floor vote."""
+    ordered = sorted(bills, key=latest_vote_date, reverse=True)
+    return ordered[:KEEP_BILLS]
+
+
 def fetch_bills(state_name, legs):
     since = (datetime.date.today() - datetime.timedelta(days=DAYS_BACK)).isoformat()
     kept = []
@@ -162,9 +174,9 @@ def fetch_bills(state_name, legs):
                     "votes": chambers,
                 })
         print("  page", page, "| bills so far with floor votes:", len(kept))
-        if len(results) < 20:
+        if len(results) < 20 or len(kept) >= STOP_AT:
             break
-    return kept
+    return trim(kept)
 
 
 def main():
